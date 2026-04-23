@@ -11,3 +11,6 @@ wheels/
 
 # MacOS-specific files
 .DS_Store
+
+# Results of running the script
+results/
