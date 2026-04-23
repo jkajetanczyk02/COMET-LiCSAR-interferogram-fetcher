@@ -16,6 +16,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import urlopen
 
+try:
+    import termios
+except ImportError:  # pragma: no cover - platforms without termios
+    termios = None
+
 DEFAULT_BASE_URL = (
     "https://gws-access.jasmin.ac.uk/public/nceo_geohazards/"
     "LiCSAR_products/"
@@ -85,6 +90,49 @@ class StopController:
     def checkpoint(self) -> None:
         if self._requested:
             raise GracefulStopRequested
+
+
+class TerminalInputGuard:
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._old_attrs = None
+        self._enabled = False
+
+    def enable(self) -> bool:
+        if termios is None:
+            return False
+        stdin = sys.stdin
+        if not hasattr(stdin, "isatty") or not stdin.isatty():
+            return False
+        if not hasattr(stdin, "fileno"):
+            return False
+
+        try:
+            fd = stdin.fileno()
+            attrs = termios.tcgetattr(fd)
+        except Exception:
+            return False
+
+        new_attrs = attrs[:]
+        # Disable echo (including newline echo) so accidental Enter/input
+        # does not render and break dashboard layout.
+        new_attrs[3] &= ~(termios.ECHO | getattr(termios, "ECHONL", 0))
+        termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+
+        self._fd = fd
+        self._old_attrs = attrs
+        self._enabled = True
+        return True
+
+    def close(self) -> None:
+        if not self._enabled or termios is None or self._fd is None or self._old_attrs is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
+        finally:
+            self._enabled = False
+            self._fd = None
+            self._old_attrs = None
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -720,7 +768,9 @@ def main() -> int:
     known_total_files = 0
     completed_targets: set[Path] = set()
     stop_controller = StopController()
+    input_guard = TerminalInputGuard()
 
+    input_guard.enable()
     dashboard = TerminalDashboard(status_order=STATUS_ORDER, lines_per_status=STATUS_LOG_LINES)
     ACTIVE_DASHBOARD = dashboard
 
@@ -1001,6 +1051,7 @@ def main() -> int:
             signal.signal(sig, prev)
         ACTIVE_DASHBOARD = None
         dashboard.close()
+        input_guard.close()
 
 
 if __name__ == "__main__":
