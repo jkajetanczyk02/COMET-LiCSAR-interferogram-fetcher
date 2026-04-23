@@ -3,6 +3,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
+import signal
 from urllib.error import HTTPError, URLError
 
 import main
@@ -416,6 +417,55 @@ class MainFlowTests(unittest.TestCase):
 
             self.assertEqual(2, rc)
             self.assertTrue(any("Nie udało się pobrać listy pakietów" in line for line in logs))
+
+    def test_main_graceful_stop_finishes_current_file_and_stops_next(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td) / "results"
+            args = self.make_args(out_dir, verify_rounds=1)
+            logs = []
+            registered_handlers = {}
+            call_count = {"n": 0}
+
+            def fake_fetch_links(url, **kwargs):
+                if url.endswith("/interferograms/"):
+                    return ["20210101_20210107/"]
+                if url.endswith("/20210101_20210107/"):
+                    return [
+                        "20210101_20210107.geo.cc.tif",
+                        "20210101_20210107.geo.unw.tif",
+                    ]
+                return []
+
+            def fake_signal(sig, handler):
+                registered_handlers[sig] = handler
+                return None
+
+            def fake_download_file(file_url, destination, **kwargs):
+                call_count["n"] += 1
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"ok")
+                if call_count["n"] == 1:
+                    handler = registered_handlers.get(signal.SIGINT)
+                    self.assertIsNotNone(handler)
+                    handler(signal.SIGINT, None)
+                return True
+
+            with patch.object(main, "parse_args", return_value=args), patch.object(
+                main, "fetch_links", side_effect=fake_fetch_links
+            ), patch.object(main, "download_file", side_effect=fake_download_file), patch.object(
+                main, "log_line", side_effect=logs.append
+            ), patch.object(
+                main, "tqdm", DummyTqdm
+            ), patch.object(
+                main.signal, "signal", side_effect=fake_signal
+            ), patch.object(
+                main.signal, "getsignal", return_value=signal.default_int_handler
+            ):
+                rc = main.main()
+
+            self.assertEqual(130, rc)
+            self.assertEqual(1, call_count["n"])
+            self.assertTrue(any("Zatrzymanie użytkownika" in line for line in logs))
 
 
 if __name__ == "__main__":

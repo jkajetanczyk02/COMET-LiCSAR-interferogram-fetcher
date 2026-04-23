@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import shutil
 import sys
 import time
@@ -48,6 +49,42 @@ STATUS_ORDER = (
     "DONE",
 )
 STATUS_LOG_LINES = 5
+
+
+class GracefulStopRequested(Exception):
+    pass
+
+
+class StopController:
+    def __init__(self) -> None:
+        self._requested = False
+        self._hard_stop = False
+        self._signals_received = 0
+
+    def request_stop(self, signum: int) -> None:
+        self._signals_received += 1
+        if self._signals_received == 1:
+            self._requested = True
+            log_line(
+                f"[WARN] Odebrano sygnał {signum}. "
+                "Zatrzymuję po zakończeniu bieżącego pliku."
+            )
+            return
+
+        self._hard_stop = True
+        raise KeyboardInterrupt
+
+    @property
+    def requested(self) -> bool:
+        return self._requested
+
+    @property
+    def hard_stop(self) -> bool:
+        return self._hard_stop
+
+    def checkpoint(self) -> None:
+        if self._requested:
+            raise GracefulStopRequested
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -682,9 +719,23 @@ def main() -> int:
     integrity_issues = 0
     known_total_files = 0
     completed_targets: set[Path] = set()
+    stop_controller = StopController()
 
     dashboard = TerminalDashboard(status_order=STATUS_ORDER, lines_per_status=STATUS_LOG_LINES)
     ACTIVE_DASHBOARD = dashboard
+
+    managed_signals = [signal.SIGINT]
+    if hasattr(signal, "SIGTERM"):
+        managed_signals.append(signal.SIGTERM)
+    previous_handlers: dict[int, object] = {}
+
+    def _signal_handler(signum, frame):
+        del frame
+        stop_controller.request_stop(signum)
+
+    for sig in managed_signals:
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _signal_handler)
 
     def mark_completed(target: Path) -> bool:
         if not is_download_complete(target):
@@ -710,6 +761,8 @@ def main() -> int:
     refresh_overall()
     try:
         for mission_endpoint in mission_endpoints:
+            if stop_controller.requested:
+                break
             try:
                 mission_url = resolve_mission_url(base_url, mission_endpoint)
             except ValueError as exc:
@@ -743,6 +796,8 @@ def main() -> int:
             mission_listing_errors = 0
 
             for package_name, package_url in packages:
+                if stop_controller.requested:
+                    break
                 package_dir = mission_dir / package_name
                 package_dir.mkdir(parents=True, exist_ok=True)
                 log_line(f"[INFO] Skanuję pakiet: {package_name}")
@@ -780,6 +835,10 @@ def main() -> int:
                 mark_completed(target)
             refresh_overall()
 
+            if stop_controller.requested:
+                log_line(f"[WARN] Przerwanie: pomijam dalsze kroki dla misji {mission_name}.")
+                break
+
             if mission_total == 0:
                 log_line(
                     f"[INFO] Misja {mission_name}: brak plików do pobrania. "
@@ -793,6 +852,8 @@ def main() -> int:
             log_line(f"[INFO] Misja {mission_name}: plików do przetworzenia: {mission_total}")
 
             for file_url, file_name, target in mission_jobs:
+                if stop_controller.requested:
+                    break
                 log_line(f"[INFO] Pobieranie pliku: {file_name}")
                 try:
                     if download_file(
@@ -821,9 +882,15 @@ def main() -> int:
                 mark_completed(target)
                 refresh_overall()
 
+            if stop_controller.requested:
+                log_line(f"[WARN] Przerwanie: weryfikacja misji {mission_name} została pominięta.")
+                break
+
             missing_jobs = collect_missing_jobs(mission_jobs)
 
             for verify_round in range(1, verify_rounds + 1):
+                if stop_controller.requested:
+                    break
                 if not missing_jobs:
                     break
 
@@ -834,6 +901,8 @@ def main() -> int:
 
                 still_missing: list[tuple[str, str, Path]] = []
                 for file_url, file_name, target in missing_jobs:
+                    if stop_controller.requested:
+                        break
                     log_line(
                         f"[VERIFY] Runda {verify_round}/{verify_rounds} "
                         f"Dogrywanie: {file_name}"
@@ -868,7 +937,12 @@ def main() -> int:
                         mark_completed(target)
                     refresh_overall()
 
+                if stop_controller.requested:
+                    break
                 missing_jobs = still_missing
+
+            if stop_controller.requested:
+                break
 
             mission_missing = len(missing_jobs)
             if mission_missing > 0:
@@ -899,6 +973,17 @@ def main() -> int:
             )
             refresh_overall()
 
+        if stop_controller.requested:
+            log_line("[DONE] Zatrzymanie użytkownika: zakończono po bieżącym pliku.")
+            log_line(
+                f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}, "
+                f"nieudane próby: {failed_attempts}, brakujące pliki: {missing_files_total}, "
+                f"błędy listingu: {integrity_issues}"
+            )
+            log_line(f"[DONE] Folder wynikowy: {results_dir}")
+            refresh_overall()
+            return 130
+
         log_line(
             f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}, "
             f"nieudane próby: {failed_attempts}, brakujące pliki: {missing_files_total}, "
@@ -912,6 +997,8 @@ def main() -> int:
             return 2
         return 0
     finally:
+        for sig, prev in previous_handlers.items():
+            signal.signal(sig, prev)
         ACTIVE_DASHBOARD = None
         dashboard.close()
 
