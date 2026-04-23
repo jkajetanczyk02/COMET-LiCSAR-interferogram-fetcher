@@ -7,6 +7,7 @@ import time
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
+from tqdm import tqdm
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import urlopen
@@ -276,10 +277,12 @@ def main() -> int:
         packages = iter_package_links(mission_url, top_links, year=args.year)
         print(f"[INFO] Znaleziono {len(packages)} pakietów z rokiem {args.year} w obu datach.")
 
+        mission_jobs: list[tuple[str, str, Path]] = []
+
         for package_name, package_url in packages:
             package_dir = mission_dir / package_name
             package_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[INFO] Pakiet: {package_name}")
+            print(f"[INFO] Skanuję pakiet: {package_name}")
 
             try:
                 package_links = fetch_links(package_url, timeout=args.timeout)
@@ -295,13 +298,52 @@ def main() -> int:
             for file_name, file_href in files:
                 file_url = urljoin(package_url, file_href)
                 target = package_dir / file_name
+                mission_jobs.append((file_url, file_name, target))
+
+        mission_total = len(mission_jobs)
+        mission_done = 0
+        mission_downloaded = 0
+        mission_skipped = 0
+        mission_failed = 0
+
+        if mission_total == 0:
+            print(f"[INFO] Misja {mission_name}: brak plików do pobrania.")
+            continue
+
+        print(f"[INFO] Misja {mission_name}: plików do przetworzenia: {mission_total}")
+        mission_bar = tqdm(
+            total=mission_total,
+            desc=f"Misja {mission_name}",
+            unit="plik",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        mission_bar.set_postfix(ok=mission_downloaded, skip=mission_skipped, fail=mission_failed)
+
+        try:
+            for file_url, file_name, target in mission_jobs:
+                print(f"[INFO] Pobieranie pliku: {file_name}")
                 try:
                     if download_file(file_url, target, timeout=args.timeout):
                         downloaded += 1
+                        mission_downloaded += 1
                     else:
                         skipped += 1
+                        mission_skipped += 1
                 except (HTTPError, URLError, TimeoutError) as exc:
+                    mission_failed += 1
                     print(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
+
+                mission_done += 1
+                mission_bar.update(1)
+                mission_bar.set_postfix(ok=mission_downloaded, skip=mission_skipped, fail=mission_failed)
+        finally:
+            mission_bar.close()
+
+        print(
+            f"[INFO] Podsumowanie misji {mission_name}: "
+            f"OK:{mission_downloaded} SKIP:{mission_skipped} FAIL:{mission_failed}"
+        )
 
     print(f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}")
     print(f"[DONE] Folder wynikowy: {results_dir}")
