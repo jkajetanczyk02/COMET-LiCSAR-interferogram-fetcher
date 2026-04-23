@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import time
+from collections import deque
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable
@@ -33,6 +34,20 @@ DEFAULT_RETRIES_503 = 5
 DEFAULT_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_VERIFY_ROUNDS = 2
 StatusCallback = Callable[[str], None]
+FileProgressCallback = Callable[[str, str, int, int | None, float, float | None], None]
+STATUS_ORDER = (
+    "INFO",
+    "START",
+    "PROGRESS",
+    "OK",
+    "SKIP",
+    "RETRY",
+    "VERIFY",
+    "WARN",
+    "ERROR",
+    "DONE",
+)
+STATUS_LOG_LINES = 5
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -56,7 +71,13 @@ def format_eta(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+ACTIVE_DASHBOARD = None
+
+
 def log_line(message: str) -> None:
+    if ACTIVE_DASHBOARD is not None:
+        ACTIVE_DASHBOARD.add_log(message)
+        return
     tqdm.write(message)
 
 
@@ -68,6 +89,212 @@ def safe_status_text(message: str, max_len: int | None = None) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+class TerminalDashboard:
+    def __init__(
+        self,
+        status_order: tuple[str, ...] = STATUS_ORDER,
+        lines_per_status: int = STATUS_LOG_LINES,
+    ) -> None:
+        self.status_order = status_order
+        self.lines_per_status = lines_per_status
+        self.status_buffers = {status: deque(maxlen=lines_per_status) for status in status_order}
+        self.widgets: list = []
+        self._build_layout()
+
+    def _build_layout(self) -> None:
+        position = 0
+        self.overall_bar = tqdm(
+            total=1,
+            desc="Cały proces",
+            unit="plik",
+            dynamic_ncols=True,
+            leave=True,
+            position=position,
+        )
+        self.widgets.append(self.overall_bar)
+        position += 1
+
+        self.file_bar = tqdm(
+            total=1,
+            desc="Plik",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            dynamic_ncols=True,
+            leave=True,
+            position=position,
+        )
+        self.widgets.append(self.file_bar)
+        position += 1
+
+        self.status_headers: dict[str, object] = {}
+        self.status_lines: dict[str, list[object]] = {}
+        self.status_separators: dict[str, object] = {}
+
+        for status in self.status_order:
+            header = tqdm(
+                total=1,
+                desc="",
+                bar_format="{desc}",
+                dynamic_ncols=True,
+                leave=True,
+                position=position,
+            )
+            self.widgets.append(header)
+            self.status_headers[status] = header
+            position += 1
+
+            lines = []
+            for _ in range(self.lines_per_status):
+                line = tqdm(
+                    total=1,
+                    desc="",
+                    bar_format="{desc}",
+                    dynamic_ncols=True,
+                    leave=True,
+                    position=position,
+                )
+                self.widgets.append(line)
+                lines.append(line)
+                position += 1
+            self.status_lines[status] = lines
+
+            separator = tqdm(
+                total=1,
+                desc="",
+                bar_format="{desc}",
+                dynamic_ncols=True,
+                leave=True,
+                position=position,
+            )
+            self.widgets.append(separator)
+            self.status_separators[status] = separator
+            position += 1
+
+        self.refresh_all_statuses()
+
+    def _set_widget_text(self, widget, text: str) -> None:
+        widget.set_description_str(safe_status_text(text))
+
+    def _status_from_message(self, message: str) -> str:
+        stripped = message.strip()
+        if stripped.startswith("[") and "]" in stripped:
+            marker = stripped[1 : stripped.find("]")]
+            marker = marker.strip().upper()
+            if marker in self.status_buffers:
+                return marker
+        return "INFO"
+
+    def refresh_status(self, status: str) -> None:
+        buffer = self.status_buffers[status]
+        self._set_widget_text(
+            self.status_headers[status],
+            f"[{status}] ostatnie {len(buffer)}/{self.lines_per_status}",
+        )
+        newest_first = list(reversed(buffer))
+        for idx, widget in enumerate(self.status_lines[status]):
+            text = newest_first[idx] if idx < len(newest_first) else ""
+            self._set_widget_text(widget, text)
+        self._set_widget_text(self.status_separators[status], "-" * 24)
+
+    def refresh_all_statuses(self) -> None:
+        for status in self.status_order:
+            self.refresh_status(status)
+
+    def add_log(self, message: str) -> None:
+        status = self._status_from_message(message)
+        self.status_buffers[status].append(message)
+        self.refresh_status(status)
+
+    def update_overall(
+        self,
+        *,
+        total: int,
+        completed: int,
+        ok: int,
+        skip: int,
+        fail: int,
+        missing: int,
+        listing_errors: int,
+    ) -> None:
+        target_total = max(total, 1)
+        if self.overall_bar.total != target_total:
+            self.overall_bar.reset(total=target_total)
+            self.overall_bar.n = 0
+        if completed < self.overall_bar.n:
+            self.overall_bar.reset(total=target_total)
+            self.overall_bar.n = 0
+        delta = completed - self.overall_bar.n
+        if delta > 0:
+            self.overall_bar.update(delta)
+
+        self.overall_bar.set_description_str("Cały proces")
+        self.overall_bar.set_postfix(
+            ok=ok,
+            skip=skip,
+            fail=fail,
+            missing=missing,
+            listing=listing_errors,
+        )
+
+    def on_file_event(
+        self,
+        stage: str,
+        file_name: str,
+        downloaded: int,
+        total_bytes: int | None,
+        speed_bps: float,
+        eta_seconds: float | None,
+    ) -> None:
+        if stage == "skip":
+            self.file_bar.reset(total=1)
+            self.file_bar.n = 1
+            self.file_bar.set_description_str(safe_status_text(f"Plik: {file_name}"))
+            self.file_bar.set_postfix(done="SKIP", speed="-", eta="-")
+            return
+
+        if stage == "start":
+            target_total = max(total_bytes or 1, 1)
+            self.file_bar.reset(total=target_total)
+            self.file_bar.n = 0
+            self.file_bar.set_description_str(safe_status_text(f"Plik: {file_name}"))
+            if total_bytes:
+                self.file_bar.set_postfix(
+                    done=f"0/{format_bytes(total_bytes)}",
+                    speed="0 B/s",
+                    eta="--:--",
+                )
+            else:
+                self.file_bar.set_postfix(done="0 B", speed="0 B/s", eta="--:--")
+            return
+
+        target_total = max(total_bytes or downloaded or 1, 1)
+        if self.file_bar.total != target_total:
+            self.file_bar.total = target_total
+        if downloaded < self.file_bar.n:
+            self.file_bar.reset(total=target_total)
+            self.file_bar.n = 0
+        delta = downloaded - self.file_bar.n
+        if delta > 0:
+            self.file_bar.update(delta)
+
+        if total_bytes:
+            done_text = f"{format_bytes(downloaded)}/{format_bytes(total_bytes)}"
+        else:
+            done_text = format_bytes(downloaded)
+
+        self.file_bar.set_description_str(safe_status_text(f"Plik: {file_name}"))
+        self.file_bar.set_postfix(
+            done=done_text,
+            speed=f"{format_bytes(int(max(speed_bps, 0.0)))}/s",
+            eta=format_eta(eta_seconds if eta_seconds is not None else -1),
+        )
+
+    def close(self) -> None:
+        for widget in reversed(self.widgets):
+            widget.close()
 
 
 def sanitize_name(value: str) -> str:
@@ -214,6 +441,7 @@ def download_file_from_url(
     retries_503: int,
     retry_delay_seconds: float,
     status_callback: StatusCallback | None = None,
+    file_progress_callback: FileProgressCallback | None = None,
 ) -> None:
     if destination.exists() and destination.stat().st_size == 0:
         destination.unlink()
@@ -236,6 +464,8 @@ def download_file_from_url(
         ) as response, destination.open("wb") as output:
             content_length = response.headers.get("Content-Length")
             total_bytes = int(content_length) if content_length and content_length.isdigit() else None
+            if file_progress_callback is not None:
+                file_progress_callback("start", destination.name, 0, total_bytes, 0.0, None)
 
             while True:
                 chunk = response.read(CHUNK_SIZE)
@@ -255,6 +485,15 @@ def download_file_from_url(
                     percent = (downloaded_bytes / total_bytes) * 100
                     remaining_bytes = max(total_bytes - downloaded_bytes, 0)
                     eta_seconds = remaining_bytes / speed_bps if speed_bps > 0 else -1
+                    if file_progress_callback is not None:
+                        file_progress_callback(
+                            "progress",
+                            destination.name,
+                            downloaded_bytes,
+                            total_bytes,
+                            speed_bps,
+                            eta_seconds,
+                        )
                     if status_callback is not None:
                         status_callback(
                             f"[PROGRESS] {destination.name} | "
@@ -263,6 +502,15 @@ def download_file_from_url(
                             f"{format_bytes(int(speed_bps))}/s | ETA {format_eta(eta_seconds)}"
                         )
                 else:
+                    if file_progress_callback is not None:
+                        file_progress_callback(
+                            "progress",
+                            destination.name,
+                            downloaded_bytes,
+                            total_bytes,
+                            speed_bps,
+                            None,
+                        )
                     if status_callback is not None:
                         status_callback(
                             f"[PROGRESS] {destination.name} | "
@@ -277,6 +525,15 @@ def download_file_from_url(
 
     total_elapsed = max(time.monotonic() - start_ts, 1e-9)
     average_speed_bps = downloaded_bytes / total_elapsed
+    if file_progress_callback is not None:
+        file_progress_callback(
+            "done",
+            destination.name,
+            downloaded_bytes,
+            total_bytes,
+            average_speed_bps,
+            0.0,
+        )
     if status_callback is not None:
         status_callback(
             f"[OK] {destination.name} | "
@@ -293,8 +550,11 @@ def download_file(
     retries_503: int,
     retry_delay_seconds: float,
     status_callback: StatusCallback | None = None,
+    file_progress_callback: FileProgressCallback | None = None,
 ) -> bool:
     if is_download_complete(destination):
+        if file_progress_callback is not None:
+            file_progress_callback("skip", destination.name, 0, None, 0.0, None)
         if status_callback is not None:
             status_callback(f"[SKIP] {destination.name}")
         return False
@@ -311,6 +571,7 @@ def download_file(
                 retries_503=retries_503,
                 retry_delay_seconds=retry_delay_seconds,
                 status_callback=status_callback,
+                file_progress_callback=file_progress_callback,
             )
             return True
         except Exception as exc:
@@ -404,6 +665,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global ACTIVE_DASHBOARD
     args = parse_args()
     base_url = normalize_url(args.base_url)
     mission_endpoints = args.mission if args.mission else list(DEFAULT_MISSIONS)
@@ -418,232 +680,240 @@ def main() -> int:
     failed_attempts = 0
     missing_files_total = 0
     integrity_issues = 0
+    known_total_files = 0
+    completed_targets: set[Path] = set()
 
-    for mission_endpoint in mission_endpoints:
-        try:
-            mission_url = resolve_mission_url(base_url, mission_endpoint)
-        except ValueError as exc:
-            log_line(f"[WARN] Pomijam misję '{mission_endpoint}': {exc}")
-            continue
+    dashboard = TerminalDashboard(status_order=STATUS_ORDER, lines_per_status=STATUS_LOG_LINES)
+    ACTIVE_DASHBOARD = dashboard
 
-        mission_name = mission_folder_name(mission_url, mission_endpoint)
-        mission_dir = results_dir / mission_name
-        mission_dir.mkdir(parents=True, exist_ok=True)
-        mission_bar = tqdm(
-            total=1,
-            desc=f"Misja {mission_name} (skanowanie)",
-            unit="plik",
-            dynamic_ncols=True,
-            leave=True,
-            position=0,
+    def mark_completed(target: Path) -> bool:
+        if not is_download_complete(target):
+            return False
+        resolved = target.resolve()
+        if resolved in completed_targets:
+            return False
+        completed_targets.add(resolved)
+        return True
+
+    def refresh_overall() -> None:
+        missing = max(known_total_files - len(completed_targets), 0)
+        dashboard.update_overall(
+            total=known_total_files,
+            completed=len(completed_targets),
+            ok=downloaded,
+            skip=skipped,
+            fail=failed_attempts,
+            missing=missing,
+            listing_errors=integrity_issues,
         )
-        status_line = tqdm(
-            total=1,
-            desc="",
-            bar_format="{desc}",
-            dynamic_ncols=True,
-            leave=False,
-            position=1,
-        )
 
-        def set_status(message: str) -> None:
-            status_line.set_description_str(safe_status_text(message))
+    refresh_overall()
+    try:
+        for mission_endpoint in mission_endpoints:
+            try:
+                mission_url = resolve_mission_url(base_url, mission_endpoint)
+            except ValueError as exc:
+                log_line(f"[WARN] Pomijam misję '{mission_endpoint}': {exc}")
+                refresh_overall()
+                continue
 
-        set_status(f"[INFO] Misja: {mission_name} ({mission_url})")
-
-        try:
-            top_links = fetch_links(
-                mission_url,
-                timeout=args.timeout,
-                retries_503=retries_503,
-                retry_delay_seconds=retry_delay_seconds,
-                status_callback=set_status,
-            )
-        except (HTTPError, URLError, TimeoutError) as exc:
-            log_line(f"[ERROR] Nie udało się pobrać listy pakietów z {mission_url}: {exc}")
-            integrity_issues += 1
-            status_line.close()
-            mission_bar.close()
-            continue
-
-        packages = iter_package_links(mission_url, top_links, year=args.year)
-        set_status(f"[INFO] Znaleziono {len(packages)} pakietów z rokiem {args.year} w obu datach.")
-
-        mission_jobs: list[tuple[str, str, Path]] = []
-        mission_listing_errors = 0
-
-        for package_name, package_url in packages:
-            package_dir = mission_dir / package_name
-            package_dir.mkdir(parents=True, exist_ok=True)
-            set_status(f"[INFO] Skanuję pakiet: {package_name}")
+            mission_name = mission_folder_name(mission_url, mission_endpoint)
+            mission_dir = results_dir / mission_name
+            mission_dir.mkdir(parents=True, exist_ok=True)
+            log_line(f"[INFO] Misja: {mission_name} ({mission_url})")
 
             try:
-                package_links = fetch_links(
-                    package_url,
+                top_links = fetch_links(
+                    mission_url,
                     timeout=args.timeout,
                     retries_503=retries_503,
                     retry_delay_seconds=retry_delay_seconds,
-                    status_callback=set_status,
+                    status_callback=log_line,
                 )
             except (HTTPError, URLError, TimeoutError) as exc:
-                log_line(f"[ERROR] Pomijam {package_url} (błąd pobrania listingu): {exc}")
-                mission_listing_errors += 1
+                log_line(f"[ERROR] Nie udało się pobrać listy pakietów z {mission_url}: {exc}")
+                integrity_issues += 1
+                refresh_overall()
                 continue
 
-            files = iter_target_files(package_links)
-            if not files:
-                log_line(f"[WARN] Brak plików .geo.cc/.geo.unw (.tif/.tiff) w pakiecie {package_name}")
+            packages = iter_package_links(mission_url, top_links, year=args.year)
+            log_line(f"[INFO] Znaleziono {len(packages)} pakietów z rokiem {args.year} w obu datach.")
+
+            mission_jobs: list[tuple[str, str, Path]] = []
+            mission_listing_errors = 0
+
+            for package_name, package_url in packages:
+                package_dir = mission_dir / package_name
+                package_dir.mkdir(parents=True, exist_ok=True)
+                log_line(f"[INFO] Skanuję pakiet: {package_name}")
+
+                try:
+                    package_links = fetch_links(
+                        package_url,
+                        timeout=args.timeout,
+                        retries_503=retries_503,
+                        retry_delay_seconds=retry_delay_seconds,
+                        status_callback=log_line,
+                    )
+                except (HTTPError, URLError, TimeoutError) as exc:
+                    log_line(f"[ERROR] Pomijam {package_url} (błąd pobrania listingu): {exc}")
+                    mission_listing_errors += 1
+                    continue
+
+                files = iter_target_files(package_links)
+                if not files:
+                    log_line(f"[WARN] Brak plików .geo.cc/.geo.unw (.tif/.tiff) w pakiecie {package_name}")
+                    continue
+
+                for file_name, file_href in files:
+                    file_url = urljoin(package_url, file_href)
+                    target = package_dir / file_name
+                    mission_jobs.append((file_url, file_name, target))
+
+            mission_total = len(mission_jobs)
+            mission_downloaded = 0
+            mission_skipped = 0
+            mission_failed = 0
+
+            known_total_files += mission_total
+            for _, _, target in mission_jobs:
+                mark_completed(target)
+            refresh_overall()
+
+            if mission_total == 0:
+                log_line(
+                    f"[INFO] Misja {mission_name}: brak plików do pobrania. "
+                    f"Błędy listingu: {mission_listing_errors}"
+                )
+                if mission_listing_errors > 0:
+                    integrity_issues += mission_listing_errors
+                refresh_overall()
                 continue
 
-            for file_name, file_href in files:
-                file_url = urljoin(package_url, file_href)
-                target = package_dir / file_name
-                mission_jobs.append((file_url, file_name, target))
+            log_line(f"[INFO] Misja {mission_name}: plików do przetworzenia: {mission_total}")
 
-        mission_total = len(mission_jobs)
-        mission_done = 0
-        mission_downloaded = 0
-        mission_skipped = 0
-        mission_failed = 0
+            for file_url, file_name, target in mission_jobs:
+                log_line(f"[INFO] Pobieranie pliku: {file_name}")
+                try:
+                    if download_file(
+                        file_url=file_url,
+                        destination=target,
+                        timeout=args.timeout,
+                        retries_503=retries_503,
+                        retry_delay_seconds=retry_delay_seconds,
+                        status_callback=log_line,
+                        file_progress_callback=dashboard.on_file_event,
+                    ):
+                        downloaded += 1
+                        mission_downloaded += 1
+                    else:
+                        skipped += 1
+                        mission_skipped += 1
+                except (HTTPError, URLError, TimeoutError) as exc:
+                    mission_failed += 1
+                    failed_attempts += 1
+                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
+                except Exception as exc:
+                    mission_failed += 1
+                    failed_attempts += 1
+                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
 
-        mission_bar.reset(total=max(mission_total, 1))
-        mission_bar.n = 0
-        mission_bar.set_description_str(f"Misja {mission_name}")
-        mission_bar.set_postfix(ok=mission_downloaded, skip=mission_skipped, fail=mission_failed)
+                mark_completed(target)
+                refresh_overall()
 
-        if mission_total == 0:
-            set_status(
-                f"[INFO] Misja {mission_name}: brak plików do pobrania. "
-                f"Błędy listingu: {mission_listing_errors}"
-            )
-            mission_bar.update(1)
+            missing_jobs = collect_missing_jobs(mission_jobs)
+
+            for verify_round in range(1, verify_rounds + 1):
+                if not missing_jobs:
+                    break
+
+                log_line(
+                    f"[VERIFY] Misja {mission_name}: runda {verify_round}/{verify_rounds}, "
+                    f"brakujące pliki: {len(missing_jobs)}"
+                )
+
+                still_missing: list[tuple[str, str, Path]] = []
+                for file_url, file_name, target in missing_jobs:
+                    log_line(
+                        f"[VERIFY] Runda {verify_round}/{verify_rounds} "
+                        f"Dogrywanie: {file_name}"
+                    )
+                    try:
+                        if download_file(
+                            file_url=file_url,
+                            destination=target,
+                            timeout=args.timeout,
+                            retries_503=retries_503,
+                            retry_delay_seconds=retry_delay_seconds,
+                            status_callback=log_line,
+                            file_progress_callback=dashboard.on_file_event,
+                        ):
+                            downloaded += 1
+                            mission_downloaded += 1
+                        else:
+                            skipped += 1
+                            mission_skipped += 1
+                    except (HTTPError, URLError, TimeoutError) as exc:
+                        mission_failed += 1
+                        failed_attempts += 1
+                        log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
+                    except Exception as exc:
+                        mission_failed += 1
+                        failed_attempts += 1
+                        log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
+
+                    if not is_download_complete(target):
+                        still_missing.append((file_url, file_name, target))
+                    else:
+                        mark_completed(target)
+                    refresh_overall()
+
+                missing_jobs = still_missing
+
+            mission_missing = len(missing_jobs)
+            if mission_missing > 0:
+                missing_files_total += mission_missing
+                log_line(f"[ERROR] Misja {mission_name}: nadal brakuje {mission_missing} plików po weryfikacji.")
+                for _, missing_name, missing_target in missing_jobs[:10]:
+                    log_line(f"[ERROR] Brak: {missing_name} -> {missing_target}")
+                if mission_missing > 10:
+                    log_line(f"[ERROR] ... i jeszcze {mission_missing - 10} plików.")
+            else:
+                log_line(f"[VERIFY] Misja {mission_name}: kompletna (wszystkie pliki obecne).")
+
             if mission_listing_errors > 0:
                 integrity_issues += mission_listing_errors
-            status_line.close()
-            mission_bar.close()
-            continue
-
-        set_status(f"[INFO] Misja {mission_name}: plików do przetworzenia: {mission_total}")
-
-        try:
-            for file_url, file_name, target in mission_jobs:
-                set_status(f"[INFO] Pobieranie pliku: {file_name}")
-                try:
-                    if download_file(
-                        file_url=file_url,
-                        destination=target,
-                        timeout=args.timeout,
-                        retries_503=retries_503,
-                        retry_delay_seconds=retry_delay_seconds,
-                        status_callback=set_status,
-                    ):
-                        downloaded += 1
-                        mission_downloaded += 1
-                    else:
-                        skipped += 1
-                        mission_skipped += 1
-                except (HTTPError, URLError, TimeoutError) as exc:
-                    mission_failed += 1
-                    failed_attempts += 1
-                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
-                except Exception as exc:
-                    mission_failed += 1
-                    failed_attempts += 1
-                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
-
-                mission_done += 1
-                mission_bar.update(1)
-                mission_bar.set_postfix(ok=mission_downloaded, skip=mission_skipped, fail=mission_failed)
-        except Exception:
-            status_line.close()
-            mission_bar.close()
-            raise
-
-        missing_jobs = collect_missing_jobs(mission_jobs)
-
-        for verify_round in range(1, verify_rounds + 1):
-            if not missing_jobs:
-                break
-
-            set_status(
-                f"[VERIFY] Misja {mission_name}: runda {verify_round}/{verify_rounds}, "
-                f"brakujące pliki: {len(missing_jobs)}"
-            )
-
-            still_missing: list[tuple[str, str, Path]] = []
-            for file_url, file_name, target in missing_jobs:
-                set_status(
-                    f"[VERIFY] Runda {verify_round}/{verify_rounds} "
-                    f"Dogrywanie: {file_name}"
+                log_line(
+                    f"[ERROR] Misja {mission_name}: {mission_listing_errors} błędów listingu; "
+                    "kompletność nie jest w 100% potwierdzona."
                 )
-                try:
-                    if download_file(
-                        file_url=file_url,
-                        destination=target,
-                        timeout=args.timeout,
-                        retries_503=retries_503,
-                        retry_delay_seconds=retry_delay_seconds,
-                        status_callback=set_status,
-                    ):
-                        downloaded += 1
-                        mission_downloaded += 1
-                    else:
-                        skipped += 1
-                        mission_skipped += 1
-                except (HTTPError, URLError, TimeoutError) as exc:
-                    mission_failed += 1
-                    failed_attempts += 1
-                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
-                except Exception as exc:
-                    mission_failed += 1
-                    failed_attempts += 1
-                    log_line(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
 
-                if not is_download_complete(target):
-                    still_missing.append((file_url, file_name, target))
-
-            missing_jobs = still_missing
-
-        mission_missing = len(missing_jobs)
-        if mission_missing > 0:
-            missing_files_total += mission_missing
-            log_line(f"[ERROR] Misja {mission_name}: nadal brakuje {mission_missing} plików po weryfikacji.")
-            for _, missing_name, missing_target in missing_jobs[:10]:
-                log_line(f"[ERROR] Brak: {missing_name} -> {missing_target}")
-            if mission_missing > 10:
-                log_line(f"[ERROR] ... i jeszcze {mission_missing - 10} plików.")
-        else:
-            log_line(f"[VERIFY] Misja {mission_name}: kompletna (wszystkie pliki obecne).")
-
-        if mission_listing_errors > 0:
-            integrity_issues += mission_listing_errors
             log_line(
-                f"[ERROR] Misja {mission_name}: {mission_listing_errors} błędów listingu; "
-                "kompletność nie jest w 100% potwierdzona."
+                f"[INFO] Podsumowanie misji {mission_name}: "
+                f"OK:{mission_downloaded} SKIP:{mission_skipped} FAIL:{mission_failed} "
+                f"MISSING:{mission_missing} LISTING_ERRORS:{mission_listing_errors}"
             )
+            log_line(
+                f"[DONE] Misja {mission_name}: OK={mission_downloaded}, SKIP={mission_skipped}, "
+                f"FAIL={mission_failed}, MISSING={mission_missing}"
+            )
+            refresh_overall()
 
         log_line(
-            f"[INFO] Podsumowanie misji {mission_name}: "
-            f"OK:{mission_downloaded} SKIP:{mission_skipped} FAIL:{mission_failed} "
-            f"MISSING:{mission_missing} LISTING_ERRORS:{mission_listing_errors}"
+            f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}, "
+            f"nieudane próby: {failed_attempts}, brakujące pliki: {missing_files_total}, "
+            f"błędy listingu: {integrity_issues}"
         )
-        set_status(
-            f"[DONE] Misja {mission_name}: OK={mission_downloaded}, SKIP={mission_skipped}, "
-            f"FAIL={mission_failed}, MISSING={mission_missing}"
-        )
-        status_line.close()
-        mission_bar.close()
-
-    log_line(
-        f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}, "
-        f"nieudane próby: {failed_attempts}, brakujące pliki: {missing_files_total}, "
-        f"błędy listingu: {integrity_issues}"
-    )
-    log_line(f"[DONE] Folder wynikowy: {results_dir}")
-    if missing_files_total > 0 or integrity_issues > 0:
-        log_line("[ERROR] Pobieranie zakończone niekompletnie.")
-        return 2
-    return 0
+        log_line(f"[DONE] Folder wynikowy: {results_dir}")
+        refresh_overall()
+        if missing_files_total > 0 or integrity_issues > 0:
+            log_line("[ERROR] Pobieranie zakończone niekompletnie.")
+            refresh_overall()
+            return 2
+        return 0
+    finally:
+        ACTIVE_DASHBOARD = None
+        dashboard.close()
 
 
 if __name__ == "__main__":
