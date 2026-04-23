@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -228,8 +229,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--results-dir",
-        default="results",
-        help="Katalog docelowy na pobrane pliki (domyślnie: results)",
+        "--output-dir",
+        "-o",
+        dest="results_dir",
+        default=os.environ.get("LICSAR_RESULTS_DIR", "results"),
+        help=(
+            "Katalog docelowy na pobrane pliki "
+            "(domyślnie: LICSAR_RESULTS_DIR lub results)"
+        ),
     )
     parser.add_argument(
         "--year",
