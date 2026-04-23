@@ -13,8 +13,9 @@ from urllib.request import urlopen
 
 DEFAULT_BASE_URL = (
     "https://gws-access.jasmin.ac.uk/public/nceo_geohazards/"
-    "LiCSAR_products/137/137A_05266_171717/interferograms/"
+    "LiCSAR_products/"
 )
+DEFAULT_MISSIONS = ("/137/137A_05266_171717/interferograms",)
 PACKAGE_PATTERN = re.compile(r"^(\d{8})_(\d{8})$")
 # W listingach LiCSAR spotyka się zarówno .tif, jak i .tiff.
 ALLOWED_SUFFIXES = (
@@ -46,6 +47,35 @@ def format_eta(seconds: float) -> str:
     if hours > 0:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def sanitize_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return name or "mission"
+
+
+def normalize_url(url: str) -> str:
+    return url if url.endswith("/") else f"{url}/"
+
+
+def resolve_mission_url(base_url: str, mission_endpoint: str) -> str:
+    endpoint = mission_endpoint.strip()
+    if not endpoint:
+        raise ValueError("Pusty endpoint misji")
+
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        return normalize_url(endpoint)
+
+    return normalize_url(urljoin(base_url, endpoint.lstrip("/")))
+
+
+def mission_folder_name(mission_url: str, mission_endpoint: str) -> str:
+    parts = [part for part in urlparse(mission_url).path.split("/") if part]
+    if len(parts) >= 3 and parts[-1] == "interferograms":
+        return sanitize_name(f"{parts[-3]}_{parts[-2]}")
+    if len(parts) >= 2:
+        return sanitize_name(parts[-2])
+    return sanitize_name(mission_endpoint)
 
 
 class HrefParser(HTMLParser):
@@ -178,10 +208,23 @@ def download_file(file_url: str, destination: Path, timeout: int) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Pobiera interferogramy z listingu HTML i zapisuje je w results/<pakiet>/"
+            "Pobiera interferogramy z listingu HTML i zapisuje je w results/<misja>/<pakiet>/"
         )
     )
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="URL do katalogu interferograms")
+    parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help="Bazowy URL do katalogu LiCSAR_products",
+    )
+    parser.add_argument(
+        "--mission",
+        action="append",
+        default=None,
+        help=(
+            "Endpoint misji (powtarzalny): np. /64/064A_04019_131313/interferograms "
+            "lub pełny URL"
+        ),
+    )
     parser.add_argument(
         "--results-dir",
         default="results",
@@ -204,48 +247,61 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    base_url = args.base_url if args.base_url.endswith("/") else f"{args.base_url}/"
+    base_url = normalize_url(args.base_url)
+    mission_endpoints = args.mission if args.mission else list(DEFAULT_MISSIONS)
     results_dir = Path(args.results_dir).resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        top_links = fetch_links(base_url, timeout=args.timeout)
-    except (HTTPError, URLError, TimeoutError) as exc:
-        print(f"[ERROR] Nie udało się pobrać listy pakietów z {base_url}: {exc}", file=sys.stderr)
-        return 1
-
-    packages = iter_package_links(base_url, top_links, year=args.year)
-    print(f"[INFO] Znaleziono {len(packages)} pakietów z rokiem {args.year} w obu datach.")
 
     downloaded = 0
     skipped = 0
 
-    for package_name, package_url in packages:
-        package_dir = results_dir / package_name
-        package_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Pakiet: {package_name}")
+    for mission_endpoint in mission_endpoints:
+        try:
+            mission_url = resolve_mission_url(base_url, mission_endpoint)
+        except ValueError as exc:
+            print(f"[WARN] Pomijam misję '{mission_endpoint}': {exc}")
+            continue
+
+        mission_name = mission_folder_name(mission_url, mission_endpoint)
+        mission_dir = results_dir / mission_name
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Misja: {mission_name} ({mission_url})")
 
         try:
-            package_links = fetch_links(package_url, timeout=args.timeout)
+            top_links = fetch_links(mission_url, timeout=args.timeout)
         except (HTTPError, URLError, TimeoutError) as exc:
-            print(f"[WARN] Pomijam {package_url} (błąd pobrania listingu): {exc}")
+            print(f"[ERROR] Nie udało się pobrać listy pakietów z {mission_url}: {exc}")
             continue
 
-        files = iter_target_files(package_links)
-        if not files:
-            print("[WARN] Brak plików .geo.cc/.geo.unw (.tif/.tiff) w tym pakiecie")
-            continue
+        packages = iter_package_links(mission_url, top_links, year=args.year)
+        print(f"[INFO] Znaleziono {len(packages)} pakietów z rokiem {args.year} w obu datach.")
 
-        for file_name, file_href in files:
-            file_url = urljoin(package_url, file_href)
-            target = package_dir / file_name
+        for package_name, package_url in packages:
+            package_dir = mission_dir / package_name
+            package_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[INFO] Pakiet: {package_name}")
+
             try:
-                if download_file(file_url, target, timeout=args.timeout):
-                    downloaded += 1
-                else:
-                    skipped += 1
+                package_links = fetch_links(package_url, timeout=args.timeout)
             except (HTTPError, URLError, TimeoutError) as exc:
-                print(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
+                print(f"[WARN] Pomijam {package_url} (błąd pobrania listingu): {exc}")
+                continue
+
+            files = iter_target_files(package_links)
+            if not files:
+                print("[WARN] Brak plików .geo.cc/.geo.unw (.tif/.tiff) w tym pakiecie")
+                continue
+
+            for file_name, file_href in files:
+                file_url = urljoin(package_url, file_href)
+                target = package_dir / file_name
+                try:
+                    if download_file(file_url, target, timeout=args.timeout):
+                        downloaded += 1
+                    else:
+                        skipped += 1
+                except (HTTPError, URLError, TimeoutError) as exc:
+                    print(f"[WARN] Nie udało się pobrać {file_url}: {exc}")
 
     print(f"[DONE] Pobrano: {downloaded}, pominięto (już istniały): {skipped}")
     print(f"[DONE] Folder wynikowy: {results_dir}")
