@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import sys
 import time
 from html.parser import HTMLParser
@@ -59,7 +60,10 @@ def log_line(message: str) -> None:
     tqdm.write(message)
 
 
-def safe_status_text(message: str, max_len: int = 180) -> str:
+def safe_status_text(message: str, max_len: int | None = None) -> str:
+    if max_len is None:
+        cols = shutil.get_terminal_size((120, 20)).columns
+        max_len = max(30, cols - 4)
     text = " ".join(message.splitlines()).strip()
     if len(text) <= max_len:
         return text
@@ -120,13 +124,11 @@ def urlopen_with_503_retry(
             retries_done += 1
             delay = retry_delay_seconds * (2 ** (retries_done - 1))
             message = (
-                f"[RETRY] 503 dla {url} | "
-                f"ponowienie {retries_done}/{retries_503} za {delay:.1f}s"
+                f"[RETRY] 503 | próba {retries_done}/{retries_503} | "
+                f"czekam {delay:.1f}s"
             )
             if status_callback is not None:
                 status_callback(message)
-            else:
-                log_line(message)
             time.sleep(delay)
 
 

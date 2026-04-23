@@ -156,7 +156,7 @@ class RetryAndParsingTests(unittest.TestCase):
         self.assertEqual(mock_open.call_count, 2)
         mock_sleep.assert_called_once_with(2.0)
         self.assertEqual(1, len(status))
-        self.assertIn("ponowienie 1/3", status[0])
+        self.assertIn("próba 1/3", status[0])
 
     def test_urlopen_with_503_retry_exhausted(self):
         status = []
